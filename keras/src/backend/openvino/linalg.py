@@ -1,3 +1,4 @@
+import numpy as np
 import openvino as ov
 import openvino.opset15 as ov_opset
 from openvino import Model
@@ -6,6 +7,7 @@ from openvino import Type
 from keras.src.backend import config
 from keras.src.backend import standardize_dtype
 from keras.src.backend.common import dtypes
+from keras.src.backend.openvino.core import OPENVINO_DTYPES
 from keras.src.backend.openvino.core import OpenVINOKerasTensor
 from keras.src.backend.openvino.core import cast
 from keras.src.backend.openvino.core import convert_to_tensor
@@ -612,7 +614,342 @@ def norm(x, ord=None, axis=None, keepdims=False):
 
 
 def qr(x, mode="reduced"):
-    raise NotImplementedError("`qr` is not supported with openvino backend")
+    if mode not in {"reduced", "complete"}:
+        raise ValueError("Expected one of {'reduced', 'complete'}.")
+
+    x = convert_to_tensor(x)
+    x_ov = get_ov_output(x)
+
+    x_ov_type = x_ov.get_element_type()
+    if x_ov_type.is_integral() or x_ov_type == Type.boolean:
+        float_type = OPENVINO_DTYPES[config.floatx()]
+        x_ov = ov_opset.convert(x_ov, float_type).output(0)
+        x_ov_type = x_ov.get_element_type()
+
+    # Shape extraction (dynamic)
+    x_partial_shape = x_ov.get_partial_shape()
+    x_rank = x_partial_shape.rank.get_length()
+
+    x_shape_node = ov_opset.shape_of(x_ov, output_type=Type.i32).output(0)
+
+    zero_i = ov_opset.constant(0, Type.i32).output(0)
+    one_i = ov_opset.constant(1, Type.i32).output(0)
+
+    m_node = ov_opset.gather(
+        x_shape_node,
+        ov_opset.constant(x_rank - 2, Type.i32).output(0),
+        zero_i,
+    ).output(0)
+
+    n_node = ov_opset.gather(
+        x_shape_node,
+        ov_opset.constant(x_rank - 1, Type.i32).output(0),
+        zero_i,
+    ).output(0)
+
+    m_static = x_partial_shape[x_rank - 2]
+    n_static = x_partial_shape[x_rank - 1]
+    m = m_static.get_length() if m_static.is_static else None
+    n = n_static.get_length() if n_static.is_static else None
+    k = min(m, n) if (m is not None and n is not None) else None
+
+    x_batched = ov_opset.reshape(
+        x_ov,
+        ov_opset.constant([-1, m, n], Type.i32).output(0),
+        False,
+    ).output(0)  # (B, M, N)
+
+    bat_shape = ov_opset.shape_of(x_batched, Type.i32).output(0)
+    batch_size_node = ov_opset.gather(
+        bat_shape,
+        ov_opset.constant([0], Type.i32).output(0),
+        zero_i,
+    ).output(0)  # shape [1]
+
+    eps = ov_opset.constant(1e-12, x_ov_type).output(0)
+    two = ov_opset.constant(2.0, x_ov_type).output(0)
+    zero_t = ov_opset.constant(0.0, x_ov_type).output(0)
+    one_t = ov_opset.constant(1.0, x_ov_type).output(0)
+    neg_one_t = ov_opset.constant(-1.0, x_ov_type).output(0)
+
+    A = x_batched
+    vs = []
+
+    # Householder triangularization
+    for ki in range(k):
+        sub_len = m - ki
+        ki_node = ov_opset.constant(ki, Type.i32).output(0)
+        if sub_len == 1:
+            zero_np = np.zeros(1, dtype=np.float32)
+            vk_zero = ov_opset.constant(zero_np).output(0)
+            if x_ov_type != Type.f32:
+                vk_zero = ov_opset.convert(vk_zero, x_ov_type).output(0)
+            # broadcast to (B, 1)
+            vk_zero = ov_opset.broadcast(
+                vk_zero,
+                ov_opset.concat(
+                    [
+                        ov_opset.reshape(
+                            batch_size_node,
+                            ov_opset.constant([1], Type.i32).output(0),
+                            False,
+                        ).output(0),
+                        ov_opset.constant([1], Type.i32).output(0),
+                    ],
+                    axis=0,
+                ).output(0),
+            ).output(0)  # (B, 1)
+            vs.append(vk_zero)
+            continue
+
+        x_sub = ov_opset.slice(
+            A,
+            ov_opset.constant([0, ki, ki], Type.i32).output(0),
+            ov_opset.constant([2**30, m, ki + 1], Type.i32).output(0),
+            ov_opset.constant([1, 1, 1], Type.i32).output(0),
+            ov_opset.constant([0, 1, 2], Type.i32).output(0),
+        ).output(0)
+
+        x_sub_sq = ov_opset.squeeze(
+            x_sub, ov_opset.constant([2], Type.i32).output(0)
+        ).output(0)  # (B, sub_len)
+
+        x_norm = ov_opset.sqrt(
+            ov_opset.reduce_sum(
+                ov_opset.multiply(x_sub_sq, x_sub_sq).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+                True,
+            ).output(0)
+        ).output(0)
+
+        x1 = ov_opset.slice(
+            x_sub_sq,
+            ov_opset.constant([0, 0], Type.i32).output(0),
+            ov_opset.constant([2**30, 1], Type.i32).output(0),
+            ov_opset.constant([1, 1], Type.i32).output(0),
+            ov_opset.constant([0, 1], Type.i32).output(0),
+        ).output(0)  # (B, 1)
+
+        x1_sign = ov_opset.select(
+            ov_opset.less(x1, zero_t).output(0),
+            neg_one_t,
+            one_t,
+        ).output(0)  # (B, 1)
+
+        sigma = ov_opset.multiply(x1_sign, x_norm).output(0)  # (B, 1)
+
+        e1_np = np.zeros(sub_len, dtype=np.float32)
+        e1_np[0] = 1.0
+        e1_const = ov_opset.constant(e1_np).output(0)
+        if x_ov_type != Type.f32:
+            e1_const = ov_opset.convert(e1_const, x_ov_type).output(0)
+
+        vk = ov_opset.add(
+            x_sub_sq,
+            ov_opset.multiply(sigma, e1_const).output(0),
+        ).output(0)  # (B, sub_len)
+
+        vk_norm = ov_opset.sqrt(
+            ov_opset.reduce_sum(
+                ov_opset.multiply(vk, vk).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+                True,
+            ).output(0)
+        ).output(0)
+        safe_vk_norm = ov_opset.maximum(vk_norm, eps).output(0)
+        vk = ov_opset.divide(vk, safe_vk_norm).output(0)  # (B, sub_len)
+
+        vs.append(vk)
+
+        A_sub = ov_opset.slice(
+            A,
+            ov_opset.constant([0, ki, ki], Type.i32).output(0),
+            ov_opset.constant([2**30, m, n], Type.i32).output(0),
+            ov_opset.constant([1, 1, 1], Type.i32).output(0),
+            ov_opset.constant([0, 1, 2], Type.i32).output(0),
+        ).output(0)  # (B, sub_len, n-ki)
+
+        vk_row = ov_opset.unsqueeze(
+            vk, ov_opset.constant([1], Type.i32).output(0)
+        ).output(0)  # (B, 1, sub_len)
+        vk_col = ov_opset.unsqueeze(
+            vk, ov_opset.constant([2], Type.i32).output(0)
+        ).output(0)  # (B, sub_len, 1)
+
+        vtA = ov_opset.matmul(vk_row, A_sub, False, False).output(
+            0
+        )  # (B, 1, n-ki)
+        outer = ov_opset.matmul(vk_col, vtA, False, False).output(
+            0
+        )  # (B, sub_len, n-ki)
+
+        A_sub_new = ov_opset.subtract(
+            A_sub,
+            ov_opset.multiply(two, outer).output(0),
+        ).output(0)
+
+        pads_begin = ov_opset.constant([0, ki, ki], Type.i32).output(0)
+        pads_end = ov_opset.constant([0, 0, 0], Type.i32).output(0)
+        A_sub_padded = ov_opset.pad(
+            A_sub_new,
+            pads_begin,
+            pads_end,
+            "constant",
+            ov_opset.constant(0.0, x_ov_type).output(0),
+        ).output(0)  # (B, M, N)
+
+        row_range = ov_opset.range(
+            zero_i, m_node, one_i, output_type=Type.i32
+        ).output(0)
+        row_mask = ov_opset.convert(
+            ov_opset.less(row_range, ki_node).output(0),
+            x_ov_type,
+        ).output(0)
+
+        col_range = ov_opset.range(
+            zero_i, n_node, one_i, output_type=Type.i32
+        ).output(0)
+        col_mask = ov_opset.convert(
+            ov_opset.less(col_range, ki_node).output(0),
+            x_ov_type,
+        ).output(0)
+
+        row_mask_col = ov_opset.unsqueeze(
+            row_mask, ov_opset.constant([1], Type.i32).output(0)
+        ).output(0)
+        col_mask_row = ov_opset.unsqueeze(
+            col_mask, ov_opset.constant([0], Type.i32).output(0)
+        ).output(0)
+
+        keep_mask = ov_opset.convert(
+            ov_opset.logical_or(
+                ov_opset.convert(row_mask_col, Type.boolean).output(0),
+                ov_opset.convert(col_mask_row, Type.boolean).output(0),
+            ).output(0),
+            x_ov_type,
+        ).output(0)
+
+        A = ov_opset.add(
+            ov_opset.multiply(A, keep_mask).output(0),
+            A_sub_padded,
+        ).output(0)
+
+    eye_const = ov_opset.eye(
+        m_node,
+        m_node,
+        ov_opset.constant(0, Type.i32).output(0),
+        x_ov_type,
+    ).output(0)
+
+    eye_const = ov_opset.unsqueeze(
+        eye_const,
+        ov_opset.constant([0], Type.i32).output(0),
+    ).output(0)
+
+    q_shape = ov_opset.concat(
+        [
+            ov_opset.reshape(
+                batch_size_node,
+                ov_opset.constant([1], Type.i32).output(0),
+                False,
+            ).output(0),
+            ov_opset.constant([m, m], Type.i32).output(0),
+        ],
+        axis=0,
+    ).output(0)
+    Q = ov_opset.broadcast(eye_const, q_shape).output(0)
+
+    for ki in range(k):
+        vk = vs[ki]
+
+        pads_begin = ov_opset.constant([0, ki], Type.i32).output(0)
+        pads_end = ov_opset.constant([0, 0], Type.i32).output(0)
+        vk_full = ov_opset.pad(
+            vk,
+            pads_begin,
+            pads_end,
+            "constant",
+            ov_opset.constant(0.0, x_ov_type).output(0),
+        ).output(0)
+
+        vk_col = ov_opset.unsqueeze(
+            vk_full, ov_opset.constant([2], Type.i32).output(0)
+        ).output(0)
+        vk_row = ov_opset.unsqueeze(
+            vk_full, ov_opset.constant([1], Type.i32).output(0)
+        ).output(0)
+
+        vtQ = ov_opset.matmul(vk_row, Q, False, False).output(0)
+        outer = ov_opset.matmul(vk_col, vtQ, False, False).output(0)
+        Q = ov_opset.subtract(
+            Q,
+            ov_opset.multiply(two, outer).output(0),
+        ).output(0)
+
+    Q = ov_opset.transpose(
+        Q,
+        ov_opset.constant([0, 2, 1], Type.i32).output(0),
+    ).output(0)
+
+    if mode == "reduced":
+        Q = ov_opset.slice(
+            Q,
+            ov_opset.constant([0, 0, 0], Type.i32).output(0),
+            ov_opset.constant([2**30, m, k], Type.i32).output(0),
+            ov_opset.constant([1, 1, 1], Type.i32).output(0),
+            ov_opset.constant([0, 1, 2], Type.i32).output(0),
+        ).output(0)  # (B, M, k)
+        A = ov_opset.slice(
+            A,
+            ov_opset.constant([0, 0, 0], Type.i32).output(0),
+            ov_opset.constant([2**30, k, n], Type.i32).output(0),
+            ov_opset.constant([1, 1, 1], Type.i32).output(0),
+            ov_opset.constant([0, 1, 2], Type.i32).output(0),
+        ).output(0)  # (B, k, N)
+        num_q_cols = k
+        num_r_rows = k
+    else:
+        num_q_cols = m
+        num_r_rows = m
+
+    if x_rank > 2:
+        batch_shape_node = ov_opset.slice(
+            x_shape_node,
+            ov_opset.constant([0], Type.i32).output(0),
+            ov_opset.constant([x_rank - 2], Type.i32).output(0),
+            ov_opset.constant([1], Type.i32).output(0),
+            ov_opset.constant([0], Type.i32).output(0),
+        ).output(0)  # (x_rank-2,)
+
+        q_out = ov_opset.concat(
+            [
+                batch_shape_node,
+                ov_opset.unsqueeze(m_node, zero_i).output(0),
+                ov_opset.unsqueeze(
+                    ov_opset.constant(num_q_cols, Type.i32).output(0), zero_i
+                ).output(0),
+            ],
+            axis=0,
+        ).output(0)
+
+        r_out = ov_opset.concat(
+            [
+                batch_shape_node,
+                ov_opset.unsqueeze(
+                    ov_opset.constant(num_r_rows, Type.i32).output(0), zero_i
+                ).output(0),
+                ov_opset.unsqueeze(n_node, zero_i).output(0),
+            ],
+            axis=0,
+        ).output(0)
+    else:
+        q_out = ov_opset.constant([m, num_q_cols], Type.i32).output(0)
+        r_out = ov_opset.constant([num_r_rows, n], Type.i32).output(0)
+
+    return (
+        OpenVINOKerasTensor(ov_opset.reshape(Q, q_out, False).output(0)),
+        OpenVINOKerasTensor(ov_opset.reshape(A, r_out, False).output(0)),
+    )
 
 
 def solve(a, b):
