@@ -1,5 +1,6 @@
 import warnings
 
+import numpy as np
 import openvino as ov
 import openvino.opset15 as ov_opset
 from openvino import Model
@@ -1632,7 +1633,255 @@ def solve_triangular(a, b, lower=False):
 
 
 def svd(x, full_matrices=True, compute_uv=True):
-    raise NotImplementedError("`svd` is not supported with openvino backend")
+    x = convert_to_tensor(x)
+    x_ov = get_ov_output(x)
+    orig_type = x_ov.get_element_type()
+
+    # Fast path: if `x` is compile-time constant, compute via NumPy.
+    try:
+        node = x_ov.get_node()
+        if node.get_type_name() == "Constant":
+            x_np = np.array(node.data)
+            if not compute_uv:
+                s_np = np.linalg.svd(
+                    x_np, full_matrices=full_matrices, compute_uv=False
+                )
+                s_out = ov_opset.constant(s_np).output(0)
+                return OpenVINOKerasTensor(s_out)
+            u_np, s_np, vh_np = np.linalg.svd(
+                x_np, full_matrices=full_matrices, compute_uv=True
+            )
+            u_out = ov_opset.constant(u_np).output(0)
+            s_out = ov_opset.constant(s_np).output(0)
+            vh_out = ov_opset.constant(vh_np).output(0)
+            return (
+                OpenVINOKerasTensor(u_out),
+                OpenVINOKerasTensor(s_out),
+                OpenVINOKerasTensor(vh_out),
+            )
+    except Exception:
+        pass
+
+    # OpenVINO does not reliably support float64 (and does not support complex)
+    # across the control-flow heavy routines we use for eigen decompositions.
+    # Work in float32 and cast back when possible.
+    if orig_type != Type.f32:
+        x_ov = ov_opset.convert(x_ov, Type.f32).output(0)
+    work_type = Type.f32
+
+    if not compute_uv:
+        # Compute singular values as sqrt(eigvals(X^T X)) sorted descending.
+        xtx = ov_opset.matmul(x_ov, x_ov, True, False).output(0)
+        w, _v = eigh(OpenVINOKerasTensor(xtx))
+        w_ov = get_ov_output(w)
+        n_s = ov_opset.gather(
+            ov_opset.shape_of(w_ov, output_type="i32").output(0),
+            ov_opset.constant([-1], Type.i32).output(0),
+            ov_opset.constant(0, Type.i32).output(0),
+        ).output(0)
+        topk = ov_opset.topk(w_ov, n_s, -1, "max", "value")
+        w_sorted = topk.output(0)
+        s = ov_opset.sqrt(
+            ov_opset.maximum(
+                w_sorted, ov_opset.constant(0.0, work_type).output(0)
+            ).output(0)
+        ).output(0)
+        if orig_type == Type.f64:
+            s = ov_opset.convert(s, Type.f64).output(0)
+        return OpenVINOKerasTensor(s)
+
+    x_shape = ov_opset.shape_of(x_ov, output_type="i32").output(0)
+    rank = x_ov.get_partial_shape().rank.get_length()
+    if rank < 2:
+        raise ValueError(
+            "Expected input to have rank >= 2. "
+            f"Received input with rank {rank}."
+        )
+
+    zero_s = ov_opset.constant(0, Type.i32).output(0)
+    minus_2 = ov_opset.constant([-2], Type.i32).output(0)
+    minus_1 = ov_opset.constant([-1], Type.i32).output(0)
+
+    m_1d = ov_opset.gather(x_shape, minus_2, zero_s).output(0)
+    n_1d = ov_opset.gather(x_shape, minus_1, zero_s).output(0)
+    m_s = ov_opset.squeeze(m_1d, zero_s).output(0)
+    n_s = ov_opset.squeeze(n_1d, zero_s).output(0)
+    k_s = ov_opset.minimum(m_s, n_s).output(0)
+
+    # Branch on static shape if available; otherwise default to the X^T X path
+    # (this keeps the graph simpler for dynamic shapes).
+    m_static, n_static = x.shape[-2], x.shape[-1]
+    use_xtx = (
+        True
+        if (m_static is None or n_static is None)
+        else (m_static >= n_static)
+    )
+    if use_xtx:
+        gram = ov_opset.matmul(x_ov, x_ov, True, False).output(0)  # [.., N, N]
+        w, v = eigh(OpenVINOKerasTensor(gram))
+        w_ov = get_ov_output(w)  # [.., N]
+        v_ov = get_ov_output(v)  # [.., N, N]
+
+        topk = ov_opset.topk(w_ov, n_s, -1, "max", "value")
+        w_sorted = topk.output(0)  # [.., N] descending
+        sort_idx = topk.output(1)  # [.., N]
+
+        v_shape = ov_opset.shape_of(v_ov, output_type="i32").output(0)
+        v_idx = ov_opset.broadcast(
+            ov_opset.unsqueeze(
+                sort_idx, ov_opset.constant(-2, Type.i32).output(0)
+            ).output(0),
+            v_shape,
+        ).output(0)
+        v_sorted = ov_opset.gather_elements(v_ov, v_idx, -1).output(0)
+
+        s_all = ov_opset.sqrt(
+            ov_opset.maximum(
+                w_sorted, ov_opset.constant(0.0, work_type).output(0)
+            ).output(0)
+        ).output(0)  # [.., N]
+        eps = ov_opset.constant(1e-12, work_type).output(0)
+        s_safe = ov_opset.maximum(s_all, eps).output(0)
+
+        # U_partial = X @ V / s
+        u_full_cols = ov_opset.matmul(x_ov, v_sorted, False, False).output(
+            0
+        )  # [.., M, N]
+        u_full_cols = ov_opset.divide(
+            u_full_cols,
+            ov_opset.unsqueeze(
+                s_safe, ov_opset.constant(-2, Type.i32).output(0)
+            ).output(0),
+        ).output(0)
+
+        # Vh (a.k.a. V^T), with the same convention as other backends.
+        perm = list(range(rank))
+        perm[-2], perm[-1] = perm[-1], perm[-2]
+        vh_full = ov_opset.transpose(
+            v_sorted, ov_opset.constant(perm, Type.i32).output(0)
+        ).output(0)
+
+        # Reduced/full slicing for outputs.
+        u_out = u_full_cols
+        vh_out = vh_full
+        s_out = s_all
+
+        if not full_matrices:
+            # U[..., M, K] where K = min(M, N): slice last dim to k.
+            u_out = ov_opset.slice(
+                u_out,
+                ov_opset.constant([0], Type.i32).output(0),
+                ov_opset.unsqueeze(k_s, zero_s).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+                ov_opset.constant([rank - 1], Type.i32).output(0),
+            ).output(0)
+            # Vh[..., K, N]: slice second-to-last dim to k.
+            vh_out = ov_opset.slice(
+                vh_out,
+                ov_opset.constant([0], Type.i32).output(0),
+                ov_opset.unsqueeze(k_s, zero_s).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+                ov_opset.constant([rank - 2], Type.i32).output(0),
+            ).output(0)
+            # s[..., K]
+            s_rank = rank - 1
+            s_out = ov_opset.slice(
+                s_out,
+                ov_opset.constant([0], Type.i32).output(0),
+                ov_opset.unsqueeze(k_s, zero_s).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+                ov_opset.constant([s_rank - 1], Type.i32).output(0),
+            ).output(0)
+        else:
+            # Make U full (M x M) via QR when M > N.
+            if (
+                m_static is not None
+                and n_static is not None
+                and m_static > n_static
+            ):
+                q, _r = qr(OpenVINOKerasTensor(u_out), mode="complete")
+                u_out = get_ov_output(q)
+
+        if orig_type == Type.f64:
+            u_out = ov_opset.convert(u_out, Type.f64).output(0)
+            s_out = ov_opset.convert(s_out, Type.f64).output(0)
+            vh_out = ov_opset.convert(vh_out, Type.f64).output(0)
+        return (
+            OpenVINOKerasTensor(u_out),
+            OpenVINOKerasTensor(s_out),
+            OpenVINOKerasTensor(vh_out),
+        )
+
+    # Fallback for the M < N case with static shapes (compute from X X^T).
+    gram = ov_opset.matmul(x_ov, x_ov, False, True).output(0)  # [.., M, M]
+    w, u = eigh(OpenVINOKerasTensor(gram))
+    w_ov = get_ov_output(w)  # [.., M]
+    u_ov = get_ov_output(u)  # [.., M, M]
+
+    topk = ov_opset.topk(w_ov, m_s, -1, "max", "value")
+    w_sorted = topk.output(0)
+    sort_idx = topk.output(1)
+
+    u_shape = ov_opset.shape_of(u_ov, output_type="i32").output(0)
+    u_idx = ov_opset.broadcast(
+        ov_opset.unsqueeze(
+            sort_idx, ov_opset.constant(-2, Type.i32).output(0)
+        ).output(0),
+        u_shape,
+    ).output(0)
+    u_sorted = ov_opset.gather_elements(u_ov, u_idx, -1).output(0)
+
+    s_all = ov_opset.sqrt(
+        ov_opset.maximum(
+            w_sorted, ov_opset.constant(0.0, work_type).output(0)
+        ).output(0)
+    ).output(0)  # [.., M]
+    eps = ov_opset.constant(1e-12, work_type).output(0)
+    s_safe = ov_opset.maximum(s_all, eps).output(0)
+
+    # Vh_partial = (U^T @ X) / s
+    perm = list(range(rank))
+    perm[-2], perm[-1] = perm[-1], perm[-2]
+    u_t = ov_opset.transpose(
+        u_sorted, ov_opset.constant(perm, Type.i32).output(0)
+    ).output(0)
+    vh_partial = ov_opset.matmul(u_t, x_ov, False, False).output(
+        0
+    )  # [.., M, N]
+    vh_partial = ov_opset.divide(
+        vh_partial,
+        ov_opset.unsqueeze(
+            s_safe, ov_opset.constant(-1, Type.i32).output(0)
+        ).output(0),
+    ).output(0)
+
+    u_out = u_sorted
+    s_out = s_all
+    vh_out = vh_partial
+
+    if not full_matrices:
+        pass
+    else:
+        # Complete Vh to [.., N, N] via QR on V_partial^T.
+        v_partial_t = ov_opset.transpose(
+            vh_partial, ov_opset.constant(perm, Type.i32).output(0)
+        ).output(0)
+        qv, _rv = qr(OpenVINOKerasTensor(v_partial_t), mode="complete")
+        v_full = get_ov_output(qv)  # [.., N, N]
+        vh_out = ov_opset.transpose(
+            v_full, ov_opset.constant(perm, Type.i32).output(0)
+        ).output(0)
+
+    if orig_type == Type.f64:
+        u_out = ov_opset.convert(u_out, Type.f64).output(0)
+        s_out = ov_opset.convert(s_out, Type.f64).output(0)
+        vh_out = ov_opset.convert(vh_out, Type.f64).output(0)
+
+    return (
+        OpenVINOKerasTensor(u_out),
+        OpenVINOKerasTensor(s_out),
+        OpenVINOKerasTensor(vh_out),
+    )
 
 
 def lstsq(a, b, rcond=None):
